@@ -1,1 +1,271 @@
 
+name: PC Virtual Lite - RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+
+      # ==========================================
+      # 1. CONFIGURAR RDP
+      # ==========================================
+      - name: Configurar RDP
+        shell: powershell
+        run: |
+          Write-Host "Configurando Remote Desktop..."
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' `
+            -Value 0 `
+            -Force
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' `
+            -Value 0 `
+            -Force
+
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue
+
+          Set-Service `
+            -Name TermService `
+            -StartupType Automatic
+
+          Restart-Service `
+            -Name TermService `
+            -Force
+
+          Write-Host "RDP configurado."
+
+      # ==========================================
+      # 2. CRIAR USUÁRIO RDP
+      # ==========================================
+      - name: Criar usuário RDP
+        shell: powershell
+        run: |
+
+          $chars = @(
+            [char[]]"ABCDEFGHJKLMNPQRSTUVWXYZ"
+            [char[]]"abcdefghijkmnopqrstuvwxyz"
+            [char[]]"23456789"
+            [char[]]"!@#$%^&*"
+          )
+
+          $passwordChars = @()
+
+          foreach ($set in $chars) {
+              $passwordChars += $set | Get-Random
+          }
+
+          $allChars = $chars | ForEach-Object { $_ }
+
+          while ($passwordChars.Count -lt 20) {
+              $passwordChars += $allChars | Get-Random
+          }
+
+          $password = -join ($passwordChars | Sort-Object { Get-Random })
+
+          $securePassword = ConvertTo-SecureString `
+            $password `
+            -AsPlainText `
+            -Force
+
+          # Remover usuário antigo se existir
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+              Remove-LocalUser -Name "RDP"
+          }
+
+          New-LocalUser `
+            -Name "RDP" `
+            -Password $securePassword `
+            -AccountNeverExpires `
+            -PasswordNeverExpires
+
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member "RDP"
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member "RDP"
+
+          "RDP_USERNAME=RDP" >> $env:GITHUB_ENV
+          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+          Write-Host "Usuário RDP criado."
+
+      # ==========================================
+      # 3. INSTALAR TAILSCALE
+      # ==========================================
+      - name: Instalar Tailscale
+        shell: powershell
+        run: |
+
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+
+          $installer = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest `
+            -Uri $url `
+            -OutFile $installer
+
+          Start-Process `
+            msiexec.exe `
+            -ArgumentList "/i `"$installer`" /quiet /norestart" `
+            -Wait
+
+          Remove-Item `
+            $installer `
+            -Force
+
+          Write-Host "Tailscale instalado."
+
+      # ==========================================
+      # 4. CONECTAR TAILSCALE
+      # ==========================================
+      - name: Conectar Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+      # ==========================================
+      # 5. DESCOBRIR IP TAILSCALE
+      # ==========================================
+      - name: Obter IP Tailscale
+        shell: powershell
+        run: |
+
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          $ip = $null
+
+          for ($i = 1; $i -le 20; $i++) {
+
+              $ip = & $tailscale ip -4 2>$null
+
+              if ($ip) {
+                  break
+              }
+
+              Write-Host "Aguardando Tailscale... tentativa $i/20"
+
+              Start-Sleep -Seconds 3
+          }
+
+          if (-not $ip) {
+              Write-Error "Não foi possível obter o IP Tailscale."
+              exit 1
+          }
+
+          $ip = $ip.Trim()
+
+          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+
+          Write-Host "IP Tailscale: $ip"
+
+      # ==========================================
+      # 6. OTIMIZAÇÕES LEVES
+      # ==========================================
+      - name: Otimizar Windows para RDP
+        shell: powershell
+        run: |
+
+          Write-Host "Aplicando otimizações..."
+
+          # Desativar animações
+          Set-ItemProperty `
+            -Path "HKCU:\Control Panel\Desktop" `
+            -Name "MenuShowDelay" `
+            -Value "0"
+
+          # Prioridade do processo do Roblox quando iniciar
+          New-Item `
+            -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\RobloxPlayerBeta.exe\PerfOptions" `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          New-ItemProperty `
+            -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\RobloxPlayerBeta.exe\PerfOptions" `
+            -Name "CpuPriorityClass" `
+            -PropertyType DWord `
+            -Value 3 `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "Otimizações aplicadas."
+
+      # ==========================================
+      # 7. TESTAR RDP
+      # ==========================================
+      - name: Testar porta RDP
+        shell: powershell
+        run: |
+
+          Write-Host "Testando RDP..."
+
+          $result = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389
+
+          if (-not $result.TcpTestSucceeded) {
+
+              Write-Host "RDP ainda não respondeu."
+              Write-Host "Isso pode acontecer antes do serviço terminar de iniciar."
+
+          } else {
+
+              Write-Host "RDP funcionando!"
+          }
+
+      # ==========================================
+      # 8. MOSTRAR DADOS
+      # ==========================================
+      - name: Informações da PC Virtual
+        shell: powershell
+        run: |
+
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "        PC VIRTUAL LITE - ONLINE"
+          Write-Host "=========================================="
+          Write-Host ""
+          Write-Host "IP Tailscale : $env:TAILSCALE_IP"
+          Write-Host "Usuário      : $env:RDP_USERNAME"
+          Write-Host "Senha        : $env:RDP_PASSWORD"
+          Write-Host "Porta        : 3389"
+          Write-Host ""
+          Write-Host "Windows      : $([System.Environment]::OSVersion.Version)"
+          Write-Host "CPU          : $env:NUMBER_OF_PROCESSORS"
+          Write-Host ""
+          Write-Host "Conecte pelo aplicativo Microsoft Remote Desktop."
+          Write-Host ""
+          Write-Host "=========================================="
+
+      # ==========================================
+      # 9. MANTER A VM LIGADA
+      # ==========================================
+      - name: Manter PC Virtual Online
+        shell: powershell
+        run: |
+
+          Write-Host ""
+          Write-Host "PC Virtual está ONLINE."
+          Write-Host "Tempo máximo desta sessão: 6 horas."
+          Write-Host ""
+
+          while ($true) {
+
+              $time = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+              Write-Host "[$time] PC Virtual ONLINE"
+
+              Start-Sleep -Seconds 300
+          }
